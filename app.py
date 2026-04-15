@@ -1,0 +1,442 @@
+# -*- coding: utf-8 -*-
+"""
+數學解題助教 - Streamlit 版
+部署目標：Streamlit Cloud
+"""
+
+import io
+import time
+import tempfile
+import os
+import re
+import concurrent.futures
+import streamlit as st
+from google import genai
+from google.genai import types
+from google.oauth2.service_account import Credentials
+import gspread
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+
+# ============================================================
+# 常數
+# ============================================================
+SS_ID           = '1G0hBHKoGRP9009a1ga601ToEoMhn8X8VqXAzcMA6K9Y'
+DRIVE_FOLDER_ID = '1wkd7D1zBPM71sgOaqMQBq2RibsVqzLB9'
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+# ============================================================
+# Google 服務初始化（從 Streamlit secrets 取憑證）
+# ============================================================
+
+@st.cache_resource
+def get_gspread_client():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    return gspread.authorize(creds)
+
+@st.cache_resource
+def get_drive_service():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    return build("drive", "v3", credentials=creds)
+
+@st.cache_resource
+def get_spreadsheet():
+    gc = get_gspread_client()
+    return gc.open_by_key(SS_ID)
+
+# ============================================================
+# Sheets 操作
+# ============================================================
+
+def login_user(account: str, password: str):
+    """驗證帳號密碼，回傳帳號資訊 dict 或 None"""
+    sh = get_spreadsheet()
+    ws = sh.worksheet("accounts")
+    rows = ws.get_all_values()
+    for row in rows[1:]:
+        if len(row) >= 5 and str(row[0]) == account and str(row[1]) == password:
+            return {
+                "account":   row[0],
+                "tutorName": row[2],
+                "keyName":   row[3],
+                "modelName": row[4],
+            }
+    return None
+
+def get_api_key(key_name: str) -> str | None:
+    sh = get_spreadsheet()
+    ws = sh.worksheet("api_keys")
+    rows = ws.get_all_values()
+    for row in rows[1:]:
+        if len(row) >= 2 and str(row[0]) == key_name:
+            return str(row[1])
+    return None
+
+def write_record(account, tutor_name, key_name, model_name,
+                 answer, has_answer, ai_result, image_url):
+    sh = get_spreadsheet()
+    ws = sh.worksheet("records")
+    from datetime import datetime
+    import pytz
+    now = datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+    ws.append_row([
+        now, account, tutor_name, key_name, model_name,
+        answer.strip() if has_answer else "",
+        "FALSE" if has_answer else "TRUE",
+        ai_result.get("scaffold1", ""),
+        ai_result.get("scaffold2", ""),
+        ai_result.get("scaffold3", ""),
+        ai_result.get("explanation", ""),
+        image_url,
+    ])
+
+# ============================================================
+# Drive 存圖
+# ============================================================
+
+def upload_image_to_drive(img_bytes: bytes, filename: str) -> str:
+    """將圖片上傳至指定 Drive 資料夾，回傳 web 連結"""
+    drive = get_drive_service()
+    file_metadata = {
+        "name": filename,
+        "parents": [DRIVE_FOLDER_ID],
+    }
+    media = MediaIoBaseUpload(io.BytesIO(img_bytes), mimetype="image/jpeg")
+    file = drive.files().create(
+        body=file_metadata, media_body=media, fields="id,webViewLink"
+    ).execute()
+    # 設定公開連結（ANYONE_WITH_LINK）
+    drive.permissions().create(
+        fileId=file["id"],
+        body={"type": "anyone", "role": "reader"},
+    ).execute()
+    return file.get("webViewLink", "（連結取得失敗）")
+
+# ============================================================
+# AI Prompts
+# ============================================================
+
+def build_explanation_prompt(has_answer: bool, answer: str) -> str:
+    answer_line = (
+        f"本題正確答案為：{answer.strip()}，請以此答案為基礎撰寫，不需要自行推導。"
+        if has_answer else "請自行推導本題答案。"
+    )
+    return f"""你是一位資深的國中數學老師，請針對這道數學題目提供完整的解析。
+你必須使用繁體中文回答。
+
+【已知條件】
+- 題目圖片：（附圖）
+- {answer_line}
+
+## 解析格式
+請依照以下結構撰寫：
+
+📌 **題目考點**：（這題考的知識點是什麼）
+💡 **解題思路**：（用什麼方法來解題）
+📝 **解題過程**：（具體的計算步驟，要算出最終答案）
+✅ **答案**：（最終答案）
+
+## 數學符號
+- 所有數學符號、公式一律使用 LaTeX 語法
+- 行內公式用 $...$ 包裹，獨立公式用 $$...$$ 包裹
+- 分式必須用 $\\frac{{分子}}{{分母}}$，不得用 / 代替
+
+## 重要限制
+- 解析控制在 300 字以內
+- 只能使用國中課程範圍內的數學知識"""
+
+
+def build_scaffold_prompt(has_answer: bool, answer: str) -> str:
+    answer_line = (
+        f"本題正確答案為：{answer.strip()}，請以此答案為基礎撰寫鷹架，不需要自行推導答案。"
+        if has_answer else "請自行推導本題答案作為鷹架依據。"
+    )
+    sc3_rule = (
+        "最後一個步驟以「請你完成計算：$算式 = ?$」的方式呈現，不得寫出最終數字答案或選項。"
+        if has_answer else "按步驟完整列出，最後直接寫出推導的答案。"
+    )
+    return f"""你是一位資深的國中數學老師，請針對這道數學題目產出三個層次的學習鷹架說明。
+你必須使用繁體中文回答。
+
+【已知條件】
+- 題目圖片：（附圖）
+- {answer_line}
+
+## 輸出格式（嚴格遵守，不得有任何額外文字）
+
+【第1層鷹架】
+（從題目文字或圖形指出需要用到哪些知識點，直接列出名稱，不使用提問句。）
+
+【第2層鷹架】
+（針對第1層知識點，說明公式中每個符號對應題目中哪個已知條件，只做對應說明，不代入計算。）
+
+【第3層鷹架】
+（按步驟列出計算過程，包含代入數值後的每一步算式。{sc3_rule}）
+
+## 數學符號
+- 所有數學符號、公式一律使用 LaTeX 語法
+- 行內公式用 $...$ 包裹，獨立公式用 $$...$$ 包裹
+- 分式必須用 $\\frac{{分子}}{{分母}}$，不得用 / 代替
+- 不要用純文字寫數學符號
+
+## 重要限制
+- 每層鷹架不超過 200 字
+- 只能使用國中課程範圍內的數學知識
+- 嚴格遵守輸出格式"""
+
+# ============================================================
+# AI 呼叫（對應 math_scaffold_batch 的 call_ai_with_retry）
+# ============================================================
+
+def call_with_retry(client, model_name: str, prompt: str, image_part, max_retries: int = 3) -> str:
+    last_error: Exception = RuntimeError("未知錯誤")
+    for attempt in range(max_retries):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[prompt, image_part],
+            )
+            return response.text
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(3 * (attempt + 1))
+    raise last_error
+
+
+def parse_scaffold(text: str) -> dict:
+    def get(pattern):
+        m = re.search(pattern, text, re.DOTALL)
+        return m.group(1).strip() if m else "（解析失敗，請重試）"
+    return {
+        "scaffold1": get(r"【第1層鷹架】(.*?)(?=【第2層鷹架】)"),
+        "scaffold2": get(r"【第2層鷹架】(.*?)(?=【第3層鷹架】)"),
+        "scaffold3": get(r"【第3層鷹架】(.*)$"),
+    }
+
+
+def run_ai_analysis(api_key: str, model_name: str, img_bytes: bytes,
+                    has_answer: bool, answer: str) -> dict:
+    """主 AI 分析流程：圖片上傳後平行呼叫解析+鷹架，縮短等待時間"""
+    client = genai.Client(api_key=api_key)
+
+    # 上傳圖片至 Gemini Files API
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        tmp.write(img_bytes)
+        tmp_path = tmp.name
+
+    try:
+        uploaded = client.files.upload(file=tmp_path)
+        time.sleep(1)  # 等待 File API 就緒
+        image_part = types.Part.from_uri(
+            file_uri=uploaded.uri,
+            mime_type=uploaded.mime_type,
+        )
+
+        # 解析和鷹架同時送出（parallel）
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut_exp = executor.submit(
+                call_with_retry, client, model_name,
+                build_explanation_prompt(has_answer, answer), image_part
+            )
+            fut_sc = executor.submit(
+                call_with_retry, client, model_name,
+                build_scaffold_prompt(has_answer, answer), image_part
+            )
+            exp_text = fut_exp.result()  # 等兩個都完成
+            sc_text  = fut_sc.result()
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    result = parse_scaffold(sc_text)
+    result["explanation"] = exp_text.strip() if exp_text else "（解析失敗，請重試）"
+    return result
+
+# ============================================================
+# UI 工具
+# ============================================================
+
+def render_math(text: str):
+    """在 Streamlit 裡渲染含 LaTeX 的 markdown"""
+    st.markdown(text)
+
+
+def show_scaffold_section(label: str, key: str, content: str):
+    """顯示一層鷹架，點擊才展開"""
+    with st.expander(label, expanded=st.session_state.get(key, False)):
+        render_math(content)
+
+# ============================================================
+# 頁面：登入
+# ============================================================
+
+def page_login():
+    st.title("🧮 數學解題助教")
+    st.subheader("請登入")
+    with st.form("login_form"):
+        account  = st.text_input("帳號")
+        password = st.text_input("密碼", type="password")
+        submitted = st.form_submit_button("登入")
+
+    if submitted:
+        with st.spinner("驗證中..."):
+            user = login_user(account, password)
+        if user:
+            st.session_state.user = user
+            st.session_state.page = "main"
+            st.rerun()
+        else:
+            st.error("帳號或密碼錯誤，請重試。")
+
+# ============================================================
+# 頁面：主功能
+# ============================================================
+
+def page_main():
+    user = st.session_state.user
+
+    # ── Sidebar ─────────────────────────────────────
+    with st.sidebar:
+        st.markdown(f"### 👤 {user['tutorName']}")
+        st.caption(f"模型：`{user['modelName']}`")
+        st.divider()
+        if st.button("🚪 登出"):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
+
+    st.title("🧮 數學解題助教")
+
+    # ── 圖片上傳 ─────────────────────────────────────
+    st.subheader("📸 上傳題目圖片")
+    col1, col2 = st.columns(2)
+    with col1:
+        camera_img = st.camera_input("使用相機拍攝")
+    with col2:
+        upload_img = st.file_uploader("或上傳圖片檔案", type=["jpg", "jpeg", "png"])
+
+    img_bytes = None
+    if camera_img:
+        img_bytes = camera_img.getvalue()
+    elif upload_img:
+        img_bytes = upload_img.getvalue()
+
+    if img_bytes:
+        st.image(img_bytes, caption="題目圖片", use_container_width=True)
+
+    # ── 答案輸入 ─────────────────────────────────────
+    st.subheader("✏️ 已知答案（選填）")
+    answer_input = st.text_input(
+        "若已知正確答案，請填入（留空表示讓 AI 自行推導）",
+        placeholder="例：B 或 12"
+    )
+    has_answer = bool(answer_input and answer_input.strip())
+
+    # ── 分析按鈕 ─────────────────────────────────────
+    if st.button("🔍 開始分析", type="primary", disabled=not img_bytes):
+        _do_analysis(user, img_bytes, has_answer, answer_input)
+
+
+def _do_analysis(user: dict, img_bytes: bytes, has_answer: bool, answer: str):
+    """執行 AI 分析流程並顯示結果"""
+
+    # 取 API Key
+    api_key = get_api_key(user["keyName"])
+    if not api_key:
+        st.error("找不到 API Key，請確認 api_keys 分頁設定。")
+        return
+
+    image_url = "（未儲存）"
+    ai_result  = {}
+
+    with st.status("⏳ 分析中...", expanded=True) as status:
+
+        # 存圖到 Drive
+        st.write("📤 儲存圖片至 Drive...")
+        try:
+            from datetime import datetime
+            import pytz
+            ts = datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y%m%d_%H%M%S")
+            filename = f"{user['account']}_{ts}.jpg"
+            image_url = upload_image_to_drive(img_bytes, filename)
+            st.write("✅ 圖片儲存完成")
+        except Exception as e:
+            st.write(f"⚠️ 圖片儲存失敗（不影響分析）：{e}")
+
+        # AI 分析（兩段式）
+        st.write("🤖 呼叫 AI 產出解析...")
+        try:
+            ai_result = run_ai_analysis(
+                api_key, user["modelName"], img_bytes, has_answer, answer
+            )
+            st.write("✅ AI 分析完成")
+        except Exception as e:
+            status.update(label="❌ AI 分析失敗", state="error")
+            st.error(f"AI 呼叫失敗：{e}")
+            return
+
+        # 寫入 records
+        st.write("📝 寫入紀錄...")
+        try:
+            write_record(
+                user["account"], user["tutorName"], user["keyName"],
+                user["modelName"], answer, has_answer, ai_result, image_url
+            )
+            st.write("✅ 紀錄完成")
+        except Exception as e:
+            st.write(f"⚠️ 紀錄寫入失敗：{e}")
+
+        status.update(label="✅ 分析完成！", state="complete")
+
+    # ── 顯示結果 ─────────────────────────────────────
+    st.divider()
+    st.subheader("📖 解析")
+    render_math(ai_result.get("explanation", ""))
+
+    st.divider()
+    st.subheader("🏗️ 學習鷹架")
+    st.caption("建議先試著自己解題，需要提示再展開各層鷹架。")
+
+    with st.expander("💡 第1層鷹架（知識點辨識）"):
+        render_math(ai_result.get("scaffold1", ""))
+
+    with st.expander("🔧 第2層鷹架（概念橋接）"):
+        render_math(ai_result.get("scaffold2", ""))
+
+    with st.expander("🧮 第3層鷹架（操作執行）"):
+        render_math(ai_result.get("scaffold3", ""))
+
+# ============================================================
+# 主流程
+# ============================================================
+
+def main():
+    st.set_page_config(
+        page_title="數學解題助教",
+        page_icon="🧮",
+        layout="centered"
+    )
+
+    # 初始化 session state
+    if "page" not in st.session_state:
+        st.session_state.page = "login"
+    if "user" not in st.session_state:
+        st.session_state.user = None
+
+    if st.session_state.page == "login" or st.session_state.user is None:
+        page_login()
+    else:
+        page_main()
+
+
+if __name__ == "__main__":
+    main()
