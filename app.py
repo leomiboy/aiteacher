@@ -317,17 +317,14 @@ def page_main():
     st.title("🧮 數學解題助教")
 
     # ── 圖片上傳 ─────────────────────────────────────
-    st.subheader("📸 上傳題目圖片")
-    col1, col2 = st.columns(2)
-    with col1:
-        camera_img = st.camera_input("使用相機拍攝")
-    with col2:
-        upload_img = st.file_uploader("或上傳圖片檔案", type=["jpg", "jpeg", "png"])
+    st.subheader("📷 上傳題目圖片")
+    upload_img = st.file_uploader(
+        "請用相機拍照後，匯入圖片檔案（JPG / PNG）",
+        type=["jpg", "jpeg", "png"],
+    )
 
     img_bytes = None
-    if camera_img:
-        img_bytes = camera_img.getvalue()
-    elif upload_img:
+    if upload_img:
         img_bytes = upload_img.getvalue()
 
     if img_bytes:
