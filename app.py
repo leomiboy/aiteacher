@@ -4,25 +4,21 @@
 部署目標：Streamlit Cloud
 """
 
-import io
 import time
 import tempfile
 import os
 import re
-import concurrent.futures
 import streamlit as st
 from google import genai
 from google.genai import types
 from google.oauth2.service_account import Credentials
 import gspread
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+
 
 # ============================================================
 # 常數
 # ============================================================
-SS_ID           = '1G0hBHKoGRP9009a1ga601ToEoMhn8X8VqXAzcMA6K9Y'
-DRIVE_FOLDER_ID = '1wkd7D1zBPM71sgOaqMQBq2RibsVqzLB9'
+SS_ID = '1G0hBHKoGRP9009a1ga601ToEoMhn8X8VqXAzcMA6K9Y'
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -40,12 +36,6 @@ def get_gspread_client():
     )
     return gspread.authorize(creds)
 
-@st.cache_resource
-def get_drive_service():
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=SCOPES
-    )
-    return build("drive", "v3", credentials=creds)
 
 @st.cache_resource
 def get_spreadsheet():
@@ -98,27 +88,6 @@ def write_record(account, tutor_name, key_name, model_name,
         image_url,
     ])
 
-# ============================================================
-# Drive 存圖
-# ============================================================
-
-def upload_image_to_drive(img_bytes: bytes, filename: str) -> str:
-    """將圖片上傳至指定 Drive 資料夾，回傳 web 連結"""
-    drive = get_drive_service()
-    file_metadata = {
-        "name": filename,
-        "parents": [DRIVE_FOLDER_ID],
-    }
-    media = MediaIoBaseUpload(io.BytesIO(img_bytes), mimetype="image/jpeg")
-    file = drive.files().create(
-        body=file_metadata, media_body=media, fields="id,webViewLink"
-    ).execute()
-    # 設定公開連結（ANYONE_WITH_LINK）
-    drive.permissions().create(
-        fileId=file["id"],
-        body={"type": "anyone", "role": "reader"},
-    ).execute()
-    return file.get("webViewLink", "（連結取得失敗）")
 
 # ============================================================
 # AI Prompts
@@ -223,43 +192,6 @@ def parse_scaffold(text: str) -> dict:
     }
 
 
-def run_ai_analysis(api_key: str, model_name: str, img_bytes: bytes,
-                    has_answer: bool, answer: str) -> dict:
-    """主 AI 分析流程：圖片上傳後平行呼叫解析+鷹架，縮短等待時間"""
-    client = genai.Client(api_key=api_key)
-
-    # 上傳圖片至 Gemini Files API
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        tmp.write(img_bytes)
-        tmp_path = tmp.name
-
-    try:
-        uploaded = client.files.upload(file=tmp_path)
-        time.sleep(1)  # 等待 File API 就緒
-        image_part = types.Part.from_uri(
-            file_uri=uploaded.uri,
-            mime_type=uploaded.mime_type,
-        )
-
-        # 解析和鷹架同時送出（parallel）
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            fut_exp = executor.submit(
-                call_with_retry, client, model_name,
-                build_explanation_prompt(has_answer, answer), image_part
-            )
-            fut_sc = executor.submit(
-                call_with_retry, client, model_name,
-                build_scaffold_prompt(has_answer, answer), image_part
-            )
-            exp_text = fut_exp.result()  # 等兩個都完成
-            sc_text  = fut_sc.result()
-    finally:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-    result = parse_scaffold(sc_text)
-    result["explanation"] = exp_text.strip() if exp_text else "（解析失敗，請重試）"
-    return result
 
 # ============================================================
 # UI 工具
@@ -269,11 +201,6 @@ def render_math(text: str):
     """在 Streamlit 裡渲染含 LaTeX 的 markdown"""
     st.markdown(text)
 
-
-def show_scaffold_section(label: str, key: str, content: str):
-    """顯示一層鷹架，點擊才展開"""
-    with st.expander(label, expanded=st.session_state.get(key, False)):
-        render_math(content)
 
 # ============================================================
 # 頁面：登入
@@ -326,6 +253,13 @@ def page_main():
     img_bytes = None
     if upload_img:
         img_bytes = upload_img.getvalue()
+        # 換圖偵測：hash 不同就清空舊結果
+        import hashlib
+        img_hash = hashlib.md5(img_bytes).hexdigest()
+        if st.session_state.get("img_hash") != img_hash:
+            st.session_state["img_hash"] = img_hash
+            st.session_state.pop("explanation", None)
+            st.session_state.pop("scaffold", None)
 
     if img_bytes:
         st.image(img_bytes, caption="題目圖片", use_container_width=True)
@@ -339,78 +273,136 @@ def page_main():
     has_answer = bool(answer_input and answer_input.strip())
 
     # ── 分析按鈕 ─────────────────────────────────────
-    if st.button("🔍 開始分析", type="primary", disabled=not img_bytes):
-        _do_analysis(user, img_bytes, has_answer, answer_input)
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("📖 產出解析", type="primary", disabled=not img_bytes, use_container_width=True):
+            _do_explanation(user, img_bytes, has_answer, answer_input)
+    with col_btn2:
+        if st.button("🏗️ 產出鷹架", type="secondary", disabled=not img_bytes, use_container_width=True):
+            _do_scaffold(user, img_bytes, has_answer, answer_input)
+
+    # ── 顯示保留的結果 ─────────────────────────────────────
+    if "explanation" in st.session_state:
+        st.divider()
+        st.subheader("📖 解析")
+        render_math(st.session_state["explanation"])
+
+    if "scaffold" in st.session_state:
+        sc = st.session_state["scaffold"]
+        st.divider()
+        st.subheader("🏗️ 學習鷹架")
+        st.caption("建議先試著自己解題，需要提示再展開各層鷹架。")
+        with st.expander("💡 第1層鷹架（知識點辨識）"):
+            render_math(sc.get("scaffold1", ""))
+        with st.expander("🔧 第2層鷹架（概念橋接）"):
+            render_math(sc.get("scaffold2", ""))
+        with st.expander("🧮 第3層鷹架（操作執行）"):
+            render_math(sc.get("scaffold3", ""))
 
 
-def _do_analysis(user: dict, img_bytes: bytes, has_answer: bool, answer: str):
-    """執行 AI 分析流程並顯示結果"""
-
-    # 取 API Key
+def _get_api_key_or_error(user: dict) -> str | None:
     api_key = get_api_key(user["keyName"])
     if not api_key:
         st.error("找不到 API Key，請確認 api_keys 分頁設定。")
+    return api_key
+
+
+def _do_explanation(user: dict, img_bytes: bytes, has_answer: bool, answer: str):
+    """只產出解析"""
+    api_key = _get_api_key_or_error(user)
+    if not api_key:
         return
 
-    image_url = "（未儲存）"
-    ai_result  = {}
+    client = genai.Client(api_key=api_key)
 
-    with st.status("⏳ 分析中...", expanded=True) as status:
-
-        # 存圖到 Drive
-        st.write("📤 儲存圖片至 Drive...")
+    with st.status("⏳ 產出解析中...", expanded=True) as status:
+        st.write("🤖 呼叫 AI...")
         try:
-            from datetime import datetime
-            import pytz
-            ts = datetime.now(pytz.timezone("Asia/Taipei")).strftime("%Y%m%d_%H%M%S")
-            filename = f"{user['account']}_{ts}.jpg"
-            image_url = upload_image_to_drive(img_bytes, filename)
-            st.write("✅ 圖片儲存完成")
-        except Exception as e:
-            st.write(f"⚠️ 圖片儲存失敗（不影響分析）：{e}")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+            try:
+                uploaded = client.files.upload(file=tmp_path)
+                time.sleep(1)
+                image_part = types.Part.from_uri(
+                    file_uri=uploaded.uri, mime_type=uploaded.mime_type
+                )
+                text = call_with_retry(
+                    client, user["modelName"],
+                    build_explanation_prompt(has_answer, answer),
+                    image_part,
+                )
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
-        # AI 分析（兩段式）
-        st.write("🤖 呼叫 AI 產出解析...")
-        try:
-            ai_result = run_ai_analysis(
-                api_key, user["modelName"], img_bytes, has_answer, answer
-            )
-            st.write("✅ AI 分析完成")
+            st.session_state["explanation"] = text.strip() if text else "（解析失敗，請重試）"
+            st.write("✅ 解析完成")
+            status.update(label="✅ 解析完成！", state="complete")
         except Exception as e:
-            status.update(label="❌ AI 分析失敗", state="error")
+            status.update(label="❌ 解析失敗", state="error")
             st.error(f"AI 呼叫失敗：{e}")
             return
 
-        # 寫入 records
-        st.write("📝 寫入紀錄...")
+    # 寫入紀錄（只有解析欄位）
+    try:
+        ai_result = {"scaffold1": "", "scaffold2": "", "scaffold3": "",
+                     "explanation": st.session_state["explanation"]}
+        write_record(user["account"], user["tutorName"], user["keyName"],
+                     user["modelName"], answer, has_answer, ai_result, "")
+    except Exception as e:
+        st.warning(f"⚠️ 紀錄寫入失敗：{e}")
+
+    st.rerun()
+
+
+def _do_scaffold(user: dict, img_bytes: bytes, has_answer: bool, answer: str):
+    """只產出鷹架"""
+    api_key = _get_api_key_or_error(user)
+    if not api_key:
+        return
+
+    client = genai.Client(api_key=api_key)
+
+    with st.status("⏳ 產出鷹架中...", expanded=True) as status:
+        st.write("🤖 呼叫 AI...")
         try:
-            write_record(
-                user["account"], user["tutorName"], user["keyName"],
-                user["modelName"], answer, has_answer, ai_result, image_url
-            )
-            st.write("✅ 紀錄完成")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+            try:
+                uploaded = client.files.upload(file=tmp_path)
+                time.sleep(1)
+                image_part = types.Part.from_uri(
+                    file_uri=uploaded.uri, mime_type=uploaded.mime_type
+                )
+                text = call_with_retry(
+                    client, user["modelName"],
+                    build_scaffold_prompt(has_answer, answer),
+                    image_part,
+                )
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+            st.session_state["scaffold"] = parse_scaffold(text)
+            st.write("✅ 鷹架完成")
+            status.update(label="✅ 鷹架完成！", state="complete")
         except Exception as e:
-            st.write(f"⚠️ 紀錄寫入失敗：{e}")
+            status.update(label="❌ 鷹架失敗", state="error")
+            st.error(f"AI 呼叫失敗：{e}")
+            return
 
-        status.update(label="✅ 分析完成！", state="complete")
+    # 寫入紀錄（只有鷹架欄位）
+    try:
+        sc = st.session_state["scaffold"]
+        ai_result = {**sc, "explanation": ""}
+        write_record(user["account"], user["tutorName"], user["keyName"],
+                     user["modelName"], answer, has_answer, ai_result, "")
+    except Exception as e:
+        st.warning(f"⚠️ 紀錄寫入失敗：{e}")
 
-    # ── 顯示結果 ─────────────────────────────────────
-    st.divider()
-    st.subheader("📖 解析")
-    render_math(ai_result.get("explanation", ""))
-
-    st.divider()
-    st.subheader("🏗️ 學習鷹架")
-    st.caption("建議先試著自己解題，需要提示再展開各層鷹架。")
-
-    with st.expander("💡 第1層鷹架（知識點辨識）"):
-        render_math(ai_result.get("scaffold1", ""))
-
-    with st.expander("🔧 第2層鷹架（概念橋接）"):
-        render_math(ai_result.get("scaffold2", ""))
-
-    with st.expander("🧮 第3層鷹架（操作執行）"):
-        render_math(ai_result.get("scaffold3", ""))
+    st.rerun()
 
 # ============================================================
 # 主流程
