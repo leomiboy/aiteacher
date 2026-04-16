@@ -316,29 +316,39 @@ def _do_explanation(user: dict, img_bytes: bytes, has_answer: bool, answer: str)
     client = genai.Client(api_key=api_key)
 
     with st.status("⏳ 產出解析中...", expanded=True) as status:
-        st.write("🤖 呼叫 AI...")
+        t0 = time.time()
         try:
+            st.write("📂 [1/4] 建立暫存檔案...")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
+            st.write(f"✔️ [1/4] 暫存檔建立完成（{tmp_path}\uff09")
             try:
+                st.write("☁️ [2/4] 上傳圖片至 Gemini Files API...")
                 uploaded = client.files.upload(file=tmp_path)
+                st.write(f"✔️ [2/4] 上傳完成（uri: {uploaded.uri}\uff09")
+                st.write("⏳ [3/4] 等待 File API 就緒（1 秒）...")
                 time.sleep(1)
                 image_part = types.Part.from_uri(
                     file_uri=uploaded.uri, mime_type=uploaded.mime_type
                 )
+                st.write(f"✔️ [3/4] image_part 建立完成（mime: {uploaded.mime_type}\uff09")
+                st.write(f"🤖 [4/4] 呼叫 generate_content（模型: {user['modelName']}\uff09...")
                 text = call_with_retry(
                     client, user["modelName"],
                     build_explanation_prompt(has_answer, answer),
                     image_part,
                 )
+                st.write(f"✔️ [4/4] 模型回定，回覆圖字數: {len(text) if text else 0}")
             finally:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
 
+            elapsed = time.time() - t0
             st.session_state["explanation"] = text.strip() if text else "（解析失敗，請重試）"
-            st.write("✅ 解析完成")
-            status.update(label="✅ 解析完成！", state="complete")
+            st.session_state["explanation_time"] = elapsed
+            st.write(f"✅ 解析完成（耗時 {elapsed:.1f} 秒）")
+            status.update(label=f"✅ 解析完成！（{elapsed:.1f} 秒）", state="complete")
         except Exception as e:
             status.update(label="❌ 解析失敗", state="error")
             st.error(f"AI 呼叫失敗：{e}")
@@ -365,29 +375,39 @@ def _do_scaffold(user: dict, img_bytes: bytes, has_answer: bool, answer: str):
     client = genai.Client(api_key=api_key)
 
     with st.status("⏳ 產出鷹架中...", expanded=True) as status:
-        st.write("🤖 呼叫 AI...")
+        t0 = time.time()
         try:
+            st.write("📂 [1/4] 建立暫存檔案...")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
+            st.write(f"✔️ [1/4] 暫存檔建立完成（{tmp_path}\uff09")
             try:
+                st.write("☁️ [2/4] 上傳圖片至 Gemini Files API...")
                 uploaded = client.files.upload(file=tmp_path)
+                st.write(f"✔️ [2/4] 上傳完成（uri: {uploaded.uri}\uff09")
+                st.write("⏳ [3/4] 等待 File API 就緒（1 秒）...")
                 time.sleep(1)
                 image_part = types.Part.from_uri(
                     file_uri=uploaded.uri, mime_type=uploaded.mime_type
                 )
+                st.write(f"✔️ [3/4] image_part 建立完成（mime: {uploaded.mime_type}\uff09")
+                st.write(f"🤖 [4/4] 呼叫 generate_content（模型: {user['modelName']}\uff09...")
                 text = call_with_retry(
                     client, user["modelName"],
                     build_scaffold_prompt(has_answer, answer),
                     image_part,
                 )
+                st.write(f"✔️ [4/4] 模型回定，回覆圖字數: {len(text) if text else 0}")
             finally:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
 
+            elapsed = time.time() - t0
             st.session_state["scaffold"] = parse_scaffold(text)
-            st.write("✅ 鷹架完成")
-            status.update(label="✅ 鷹架完成！", state="complete")
+            st.session_state["scaffold_time"] = elapsed
+            st.write(f"✅ 鷹架完成（耗時 {elapsed:.1f} 秒）")
+            status.update(label=f"✅ 鷹架完成！（{elapsed:.1f} 秒）", state="complete")
         except Exception as e:
             status.update(label="❌ 鷹架失敗", state="error")
             st.error(f"AI 呼叫失敗：{e}")
