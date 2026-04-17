@@ -9,6 +9,7 @@ import tempfile
 import os
 import re
 import streamlit as st
+import streamlit.components.v1 as components
 from google import genai
 from google.genai import types
 from google.oauth2.service_account import Credentials
@@ -202,6 +203,62 @@ def render_math(text: str):
     st.markdown(text)
 
 
+def show_live_timer(label: str = "⏱️ 計時中"):
+    """在頁面上嵌入一個 JS 碼表，按下按鈕後即時跳動。
+    回傳一個 placeholder，供完成後替換為最終時間。"""
+    timer_placeholder = st.empty()
+    timer_placeholder.components_html = components.html(
+        f"""
+        <div id="timer-box" style="
+            font-family: 'Courier New', monospace;
+            font-size: 2.2rem;
+            font-weight: bold;
+            color: #ff6b35;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 2px solid #ff6b35;
+            border-radius: 12px;
+            padding: 14px 24px;
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            box-shadow: 0 0 20px rgba(255,107,53,0.35);
+            animation: pulse-border 1.5s ease-in-out infinite;
+        ">
+            <span style="font-size:1.8rem;">⏱️</span>
+            <span>{label}：</span>
+            <span id="elapsed">0.0 秒</span>
+        </div>
+        <style>
+            @keyframes pulse-border {{
+                0%, 100% {{ box-shadow: 0 0 20px rgba(255,107,53,0.35); }}
+                50%        {{ box-shadow: 0 0 35px rgba(255,107,53,0.75); }}
+            }}
+        </style>
+        <script>
+            (function() {{
+                var start = Date.now();
+                var el = document.getElementById('elapsed');
+                var iv = setInterval(function() {{
+                    if (!el) {{ clearInterval(iv); return; }}
+                    var sec = ((Date.now() - start) / 1000).toFixed(1);
+                    el.textContent = sec + ' 秒';
+                }}, 100);
+            }})();
+        </script>
+        """,
+        height=90,
+    )
+    return timer_placeholder
+
+
+def show_final_time(placeholder, label: str, elapsed: float):
+    """把碼表位置替換成最終耗時顯示"""
+    placeholder.metric(
+        label=label,
+        value=f"{elapsed:.1f} 秒",
+    )
+
+
 # ============================================================
 # 頁面：登入
 # ============================================================
@@ -315,6 +372,9 @@ def _do_explanation(user: dict, img_bytes: bytes, has_answer: bool, answer: str)
 
     client = genai.Client(api_key=api_key)
 
+    # ── 顯示即時碼表 ──
+    timer_ph = show_live_timer("📖 解析計時")
+
     with st.status("⏳ 產出解析中...", expanded=True) as status:
         t0 = time.time()
         try:
@@ -354,6 +414,10 @@ def _do_explanation(user: dict, img_bytes: bytes, has_answer: bool, answer: str)
             st.error(f"AI 呼叫失敗：{e}")
             return
 
+    # ── 碼表停止，改為最終時間 ──
+    show_final_time(timer_ph, "📖 解析耗時", elapsed)
+    st.session_state["explanation_time"] = elapsed
+
     # 寫入紀錄（只有解析欄位）
     try:
         ai_result = {"scaffold1": "", "scaffold2": "", "scaffold3": "",
@@ -373,6 +437,9 @@ def _do_scaffold(user: dict, img_bytes: bytes, has_answer: bool, answer: str):
         return
 
     client = genai.Client(api_key=api_key)
+
+    # ── 顯示即時碼表 ──
+    timer_ph = show_live_timer("🏗️ 鷹架計時")
 
     with st.status("⏳ 產出鷹架中...", expanded=True) as status:
         t0 = time.time()
@@ -412,6 +479,10 @@ def _do_scaffold(user: dict, img_bytes: bytes, has_answer: bool, answer: str):
             status.update(label="❌ 鷹架失敗", state="error")
             st.error(f"AI 呼叫失敗：{e}")
             return
+
+    # ── 碼表停止，改為最終時間 ──
+    show_final_time(timer_ph, "🏗️ 鷹架耗時", elapsed)
+    st.session_state["scaffold_time"] = elapsed
 
     # 寫入紀錄（只有鷹架欄位）
     try:
