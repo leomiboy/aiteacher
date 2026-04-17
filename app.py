@@ -344,13 +344,23 @@ def page_main():
     # ── 顯示保留的結果 ─────────────────────────────────────
     if "explanation" in st.session_state:
         st.divider()
-        st.subheader("📖 解析")
+        col_h1, col_t1 = st.columns([3, 1])
+        with col_h1:
+            st.subheader("📖 解析")
+        with col_t1:
+            if "explanation_time" in st.session_state:
+                st.metric("⏱️ 解析耗時", f"{st.session_state['explanation_time']:.1f} 秒")
         render_math(st.session_state["explanation"])
 
     if "scaffold" in st.session_state:
         sc = st.session_state["scaffold"]
         st.divider()
-        st.subheader("🏗️ 學習鷹架")
+        col_h2, col_t2 = st.columns([3, 1])
+        with col_h2:
+            st.subheader("🏗️ 學習鷹架")
+        with col_t2:
+            if "scaffold_time" in st.session_state:
+                st.metric("⏱️ 鷹架耗時", f"{st.session_state['scaffold_time']:.1f} 秒")
         st.caption("建議先試著自己解題，需要提示再展開各層鷹架。")
         with st.expander("💡 第1層鷹架（知識點辨識）"):
             render_math(sc.get("scaffold1", ""))
@@ -417,9 +427,6 @@ def _do_explanation(user: dict, img_bytes: bytes, has_answer: bool, answer: str)
             st.error(f"AI 呼叫失敗：{e}")
             return
 
-    # ── 碼表停止，改為最終時間 ──
-    show_final_time(timer_ph, "📖 解析耗時", elapsed)
-    st.session_state["explanation_time"] = elapsed
 
     # 寫入紀錄（只有解析欄位）
     try:
@@ -483,9 +490,6 @@ def _do_scaffold(user: dict, img_bytes: bytes, has_answer: bool, answer: str):
             st.error(f"AI 呼叫失敗：{e}")
             return
 
-    # ── 碼表停止，改為最終時間 ──
-    show_final_time(timer_ph, "🏗️ 鷹架耗時", elapsed)
-    st.session_state["scaffold_time"] = elapsed
 
     # 寫入紀錄（只有鷹架欄位）
     try:
