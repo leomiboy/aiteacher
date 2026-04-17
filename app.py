@@ -211,27 +211,30 @@ def show_live_timer(label: str = "⏱️ 計時中"):
         f"""
         <div id="timer-box" style="
             font-family: 'Courier New', monospace;
-            font-size: 2.2rem;
+            font-size: 1.1rem;
             font-weight: bold;
             color: #ff6b35;
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             border: 2px solid #ff6b35;
-            border-radius: 12px;
-            padding: 14px 24px;
-            display: inline-flex;
+            border-radius: 8px;
+            padding: 6px 16px;
+            display: flex;
+            flex-direction: row;
             align-items: center;
-            gap: 12px;
-            box-shadow: 0 0 20px rgba(255,107,53,0.35);
+            gap: 8px;
+            width: fit-content;
+            box-shadow: 0 0 12px rgba(255,107,53,0.35);
             animation: pulse-border 1.5s ease-in-out infinite;
         ">
-            <span style="font-size:1.8rem;">⏱️</span>
+            <span>⏱️</span>
             <span>{label}：</span>
-            <span id="elapsed">0.0 秒</span>
+            <span id="elapsed" style="min-width:4ch;">0.0 秒</span>
         </div>
         <style>
+            body {{ margin: 0; padding: 0; }}
             @keyframes pulse-border {{
-                0%, 100% {{ box-shadow: 0 0 20px rgba(255,107,53,0.35); }}
-                50%        {{ box-shadow: 0 0 35px rgba(255,107,53,0.75); }}
+                0%, 100% {{ box-shadow: 0 0 12px rgba(255,107,53,0.35); }}
+                50%        {{ box-shadow: 0 0 24px rgba(255,107,53,0.70); }}
             }}
         </style>
         <script>
@@ -246,7 +249,7 @@ def show_live_timer(label: str = "⏱️ 計時中"):
             }})();
         </script>
         """,
-        height=90,
+        height=52,
     )
     return timer_placeholder
 
